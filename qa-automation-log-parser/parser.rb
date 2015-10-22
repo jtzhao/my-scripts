@@ -32,8 +32,9 @@ def extract_tarball(tarball)
   Dir.chdir('/tmp') do
     # create temporary dir
     time = Time.now.strftime("%m-%d_%H:%M:%S")
-    dir = "test-results-analyzer-#{time}"
-    FileUtils.mkdir(dir)
+    dir = File.basename(tarball).split('.')[0]
+    FileUtils.rm_rf(dir)
+    FileUtils.mkdir_p(dir)
     # extract the tarball
     Dir.chdir(dir) do
       output = `tar xf '#{tarball}'`
@@ -165,7 +166,7 @@ if __FILE__ == $0
     results = parse_test_results(results_file)
     failed_tests = select_failed_tests(results)
     unless failed_tests.empty?
-      puts ">> #{testsuite} ".ljust(80, "=")
+      puts ">> Testsuite: #{testsuite} ".ljust(80, "=")
       print_test_results(failed_tests)
       puts ""
     end
