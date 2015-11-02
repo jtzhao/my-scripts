@@ -162,7 +162,15 @@ if __FILE__ == $0
   end
 
   # print report
+  if test_results_files.empty?
+    STDERR.write("Fatal Error: No test_results files found!\n")
+    exit 1
+  end
   test_results_files.each_pair do |testsuite, results_file|
+    if not File.exist?(results_file)
+        STDERR.write("test_results file missing: #{results_file}\n")
+        next
+    end
     results = parse_test_results(results_file)
     failed_tests = select_failed_tests(results)
     unless failed_tests.empty?
