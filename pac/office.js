@@ -2,9 +2,9 @@ var proxy = "PROXY 147.2.207.100:3128"
 var direct = "DIRECT";
 
 var domains_via_proxy = [
-    "*.suse.com",
-    "*.novell.com",
+    "*.novell.*",
     "*nytimes.com",
+    "*.suse.*",
 ];
 
 var ips_via_proxy = [
