@@ -1,14 +1,0 @@
-Initializing test run for control file qa_gzip.tcf...
-Current time: Wed Dec 16 11:03:27 CST 2015
-****[37m[1m Test in progress [0m****
-[1/2] qa_gzip_compress                                [32m[54C[KPASSED (0s)       
-[0m[2/2] qa_gzip_uncompress                              [32m[54C[KPASSED (0s)       
-[0m****[37m[1m Test run complete [0m****
-Current time: Wed Dec 16 11:03:27 CST 2015
-Exiting test run..
-Displaying report...
-[36mTotal test time: [1m0s
-[0m[32mTests passed:
-[1mqa_gzip_compress qa_gzip_uncompress 
-[0m[32m[1m**** Test run completed successfully ****
-[0m

@@ -7,8 +7,11 @@ import json
 import logging
 import os
 from optparse import OptionParser
+import random
 import re
+import shutil
 import subprocess
+import uuid
 
 try:
     import xml.etree.cElementTree as ET
@@ -16,54 +19,117 @@ except ImportError:
     import xml.etree.ElementTree as ET
 
 
-# Read <count> lines from a file with a specific encoding(default: utf-8).
-# Return a unicode object.
-def read_with_encoding(path, encoding='utf-8', count=None):
-    # Expand path
-    path = os.path.expanduser(path)
-    path = os.path.expandvars(path)
-    path = os.path.abspath(path)
-    # Read file line by line
-    lines = []
-    if not os.access(path, os.R_OK):
-        return None
-    with file(path, 'rb') as f:
-        for line in f:
-            line = line.strip()
-            lines.append(line)
-            if isinstance(count, int):
-                count -= 1
-                if count <= 0:
-                    break
-    return unicode('\n'.join(lines), encoding)
 
-
-class ResultFileParser(object):
-    '''
-    Parse one test_results file to a dict
-
-    Test result file format:
-        <test_name>
-        <fail> <succeed> <count> <time> <error> <skipped>
-    '''
-    RESULT_ITEMS = ['failed', 'succeeded', 'count', 'time', 'error', 'skipped']
-
-    #   path: Path to the test_results file
-    def __init__(self, path, logger=None):
+class BaseParser(object):
+    '''Base class of parser classes'''
+    def __init__(self, logger=None):
         if logger is None:
             self.logger = logging.getLogger(self.__class__.__name__)
         else:
             self.logger = logger
-        self.testcases = []
-        self.path = path
+
+    # Expand ~ and env vars of a path and return its absolute path
+    def expand_path(self, path):
+        path = os.path.expanduser(path)
+        path = os.path.expandvars(path)
+        path = os.path.abspath(path)
+        return path
+    
+    # Read the last <count> lines from a file
+    # with a specific encoding(default: utf-8).
+    # Return a unicode object.
+    def read_with_encoding(self, path, encoding='utf-8', count=100, newline='\n'):
+        path = self.expand_path(path)
+        if not os.access(path, os.R_OK):
+            return None
+        with file(path, 'rb') as f:
+            lines = f.readlines()
+        if isinstance(count, int):
+            if count <= 0:
+                raise ValueError("count must be larger than 0")
+            lines = lines[-count:]
+        # Remove the trailing \r\n characters
+        def _rstrip(string):
+            return string.rstrip()
+        lines = map(_rstrip, lines)
+        return unicode(newline.join(lines), encoding)
+
+
+class TestsuiteLogDir(BaseParser):
+    '''
+    Parse one test_results file to a dict
+
+    Test result file format:
+        <test_name>                                         # testcase name line
+        <fail> <succeed> <count> <time> <error> <skipped>   # test result line
+    '''
+    RESULT_ITEMS = ['failed', 'succeeded', 'count', 'time', 'error', 'skipped']
+    TEST_RESULTS = 'test_results'
+
+    # path: Path to the log dir.
+    # Example: /usr/share/qa/ctcs2/qa_bzip2-2015-12-18-11-37-53
+    def __init__(self, path, logger=None):
+        super(TestsuiteLogDir, self).__init__(logger)
+        self.data = {'testsuite_name': None,
+                    'timestamp': None,
+                    'testcases': []}
+        self.path = self.expand_path(path)              # path to the log dir
+        self.basename = os.path.basename(self.path)     # name of the log dir
+        self.test_results_file = os.path.join(self.path, self.TEST_RESULTS)
+
+    # Parse dir name to get testsuite name and timestamp
+    def parse_name_timestamp(self):
+        m = re.search(r'(.*)-(\d+(?:-\d+){5})', self.basename)
+        if m is None:
+            return None
+        self.data['testsuite_name'] = m.group(1)
+        lst = m.group(2).split('-')
+        date = '-'.join(lst[:3])
+        time = ':'.join(lst[-3:])
+        self.data['timestamp'] = "%s %s" % (date, time)
+        return self.data['testsuite_name'], self.data['timestamp']
+
+    # Parse test result line and return a dict.
+    # A test result line contains 6 numbers:
+    #   <fail> <succeed> <count> <time> <error> <skipped>
+    def extract_result_line(self, line):
+        if not re.search(r'\d+(\s+\d+){5}', line):
+            raise ValueError("Invalid result line: %s" % (line))
+        nums = map(int, line.split())
+        result = {}
+        for i in range(len(self.RESULT_ITEMS)):
+            result[self.RESULT_ITEMS[i]] = nums[i]
+        return result
+
+    # Get testcase timestamp from its log
+    def extract_testcase_timestamp(self, testcase_log):
+        m = re.search(r'^(\w+ \w+ \d+ (?:\d+:){2}\d+ \w+ \d+):', testcase_log, re.MULTILINE)
+        if m is None:
+            return None
+        try:
+            d = datetime.datetime.strptime(m.group(1), '%a %b %d %H:%M:%S %Z %Y')
+            timestamp = d.strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError, e:
+            timestamp = m.group(1)
+        return timestamp
 
     # Read and parse the test_results file
-    # and save the result to self.testcases
-    def parse(self):
+    # and save the result to self.data['testcases']
+    #               [{'name'      : <testcase name>,
+    #               'failed'    : 0,
+    #               'succeeded' : 2,
+    #               'count'     : 2,
+    #               'time'      : 10,
+    #               'error'     : 0,
+    #               'skipped'   : 0,
+    #               'log'       : <100 lines of the log>}]
+    def parse_testcases(self):
+        self.data['testcases'] = []
         testcase_name = ''
         line_num = 0
-        self.logger.debug("Parsing file %s" % (self.path))
-        with file(self.path, 'r') as f:
+        self.logger.debug("Parsing file %s" % (self.test_results_file))
+        assert os.access(self.test_results_file, os.R_OK), "Failed to read %s" % (self.test_results_file)
+        with file(self.test_results_file, 'r') as f:
             # Parse test_results file line by line
             for line in f:
                 line_num += 1
@@ -72,64 +138,65 @@ class ResultFileParser(object):
                 if line_num % 2 == 1:
                     testcase_name = line
                     self.logger.debug("Parsing testcase %s" % (testcase_name))
-                    assert len(testcase_name) != 0, "Invalid format(%s:%s)" % (self.path, line_num)
+                    assert len(testcase_name) != 0, "Invalid format(%s:%s)" % (self.test_results_file, line_num)
                     continue
                 # Test result line
                 self.logger.debug("Getting results of testcase %s" % (testcase_name))
-                states = line.split()
-                assert len(states) == 6, "Invalid format(%s:%s)" % (self.path, line_num)
-                # Convert to int
                 try:
-                    states = map(int, states)
+                    testcase = self.extract_result_line(line)
                 except ValueError, e:
-                    raise ValueError("ctcs2 test results must be integers(%s:%s)" % (self.path, line_num))
-                # Save test result to self.testcases
-                d = {'name': testcase_name}
-                for i in range(len(self.RESULT_ITEMS)):
-                    key = self.RESULT_ITEMS[i]
-                    value = states[i]
-                    d[key] = value
-                d['log_file'] = os.path.join(os.path.dirname(self.path), testcase_name)
-                self.testcases.append(d)
+                    self.logger.error("Invalid test result line(%s:%s)" % (self.test_results_file, line_num))
+                    raise e
+                testcase['testcase_name'] = testcase_name
+                log_file_path = os.path.join(os.path.dirname(self.test_results_file), testcase_name)
+                testcase['log'] = self.read_with_encoding(log_file_path)
+                testcase['timestamp'] = self.extract_testcase_timestamp(testcase['log'])
+                self.data['testcases'].append(testcase)
                 # Reset testcase name
                 testcase_name = ''
         assert line_num % 2 == 0, ("No test result of testcase '%s'(%s:%s)" %
-                                (testcase_name, self.path, line_num))
-        return self.testcases
+                                (testcase_name, self.test_results_file, line_num))
+        return self.data['testcases']
+
+    # Parse all the data.
+    # Return:
+    # { 'testcases': [{'name'      : <testcase name>,
+    #               'failed'    : 0,
+    #               'succeeded' : 2,
+    #               'count'     : 2,
+    #               'time'      : 10,
+    #               'error'     : 0,
+    #               'skipped'   : 0,
+    #               'log'       : <100 lines of the log>}],
+    #   'name': <testsuite_name>,
+    #   'timestamp': <timestamp>    }
+    def parse(self):
+        self.parse_name_timestamp()
+        self.parse_testcases()
+        return self.data
 
 
-class TestsuitesParser(object):
+class TestsuiteLogTarball(BaseParser):
     '''
-    Parse a tarball or dir containing test result dirs.
+    Extract and parse the logs inside a tarball.
+    A tarball may contain multiple testsuite log dirs'''
 
-    Example:
-        /var/log/qaset/log/gzip-ACAP2-20151216-20151216T110220.tar.bz2
-        /var/log/qa/oldlogs
-    '''
+    TMP_DIR = '/tmp'
 
-    RESULT_FILE_NAME    = 'test_results'
-    TARBALL_PATTERN     = '*.tar.*'
-    TMP_DIR             = '/tmp'
-
-    # log_dir: The directory containing log tarballs or log dirs.
-    def __init__(self, log_dir, logger=None):
-        if logger is None:
-            self.logger = logging.getLogger(self.__class__.__name__)
-        else:
-            self.logger = logger
-        log_dir = os.path.expanduser(log_dir)
-        log_dir = os.path.expandvars(log_dir)
-        log_dir = os.path.abspath(log_dir)
-        self.path = log_dir
-        self.testsuites = []
+    # path: Path to the tarball containing logs. Example:
+    #       /usr/share/qaset/log/gzip-ACAP2-20151216-20151216T110220.tar.bz2
+    def __init__(self, path, logger=None):
+        super(TestsuiteLogTarball, self).__init__(logger)
+        self.path = path
         self.extraction_dir = None
+        self.data = []              # A list of testsuites
 
     # Create extraction dir for extracting tarballs
-    def mk_extraction_dir(self):
-        self.TMP_DIR = '/tmp'
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-        extraction_dir = os.path.join(self.TMP_DIR,
-                        "testsuite-log-parser_%s" % (timestamp))
+    def create_extraction_dir(self):
+        unique_id = uuid.uuid4()
+        dirname = "extracted_logs_%s" % (unique_id)
+        extraction_dir = os.path.join(self.TMP_DIR, dirname)
+        self.logger.debug("Creating %s" % (extraction_dir))
         try:
             os.mkdir(extraction_dir, 0755)
         except OSError, e:
@@ -137,80 +204,78 @@ class TestsuitesParser(object):
         except IOError, e:
             raise IOError("Failed to create %s for extraction: %s" % (extraction_dir, e))
         self.extraction_dir = extraction_dir
-        return extraction_dir
+        return self.extraction_dir
+
+    # Remove the extraction dir
+    def remove_extraction_dir(self):
+        try:
+            shutil.rmtree(self.extraction_dir)
+        except OSError, e:
+            self.logger.warning("Unable to remove extraction dir %s.\nMaybe it's already removed?" % (self.extraction_dir))
+        self.extraction_dir = None
 
     # Extract a tarball to self.extraction_dir
     # tarball: The path to the log tarball
-    def extract(self, tarball):
-        cmd = "tar xf '%s' -C '%s'" % (tarball, self.extraction_dir)
+    def extract(self):
+        cmd = "tar xf '%s' -C '%s'" % (self.path, self.extraction_dir)
         ret = subprocess.call(cmd, shell=True)
         assert ret == 0, "Extraction failed: %s" % (cmd)
 
-    # Get testsuite info from test log dir
-    # entry: Path to the test log dir(e.g. /var/log/qaset/log/qa_gzip-2015-12-16-11-02-03)
-    # info: name/timestamp
-    def get_testsuite_info(self, entry, info):
-        if info not in ['name', 'timestamp']:
-            raise ValueError("Info type not supported: %s" % (info))
-        entry = os.path.basename(entry)
-        m = re.search(r'(.*)-(\d+(?:-\d+){5})', entry)
-        if m is None:
-            return None
-        if info == 'name':
-            return m.group(1)
-        else:
-            date_time_lst = m.group(2).split('-')
-            date = '-'.join(date_time_lst[:3])
-            time = ':'.join(date_time_lst[-3:])
-            return "%s %s" % (date, time)
+    def parse(self):
+        self.create_extraction_dir()
+        self.extract()
+        for entry in glob.glob(os.path.join(self.extraction_dir, '*')):
+            p = TestsuiteLogDir(entry, self.logger)
+            try:
+                testsuite = p.parse()
+                self.data.append(testsuite)
+            except Exception, e:
+                self.logger.warning("Failed to parse %s. Skipping..." % (entry))
+        self.remove_extraction_dir()
+        # Check if there's any data
+        if len(self.data) == 0:
+            self.logger.warning("No log data in %s" % (self.path))
+        return self.data
 
-    # Get testsuite name from test log dir name
-    def get_testsuite_name(self, entry):
-        return self.get_testsuite_info(entry, 'name')
 
-    # Get testsuite timestamp from test log dir name
-    def get_testsuite_timestamp(self, entry):
-        return self.get_testsuite_info(entry, 'timestamp')
+class LogsParser(BaseParser):
+    '''
+    Parse all the logs under a directory.
+
+    Example:
+        /var/log/qaset/log/
+    '''
+
+    RESULT_FILE_NAME    = 'test_results'
+    TARBALL_PATTERN     = '*.tar.*'
+    TMP_DIR             = '/tmp'
+
+    # path: The directory containing log tarballs or log dirs.
+    #   Example: /var/log/qaset/log/
+    def __init__(self, path, logger=None):
+        super(LogsParser, self).__init__(logger)
+        self.path = path
+        self.data = []          # A list of testsuites data
 
     # Parse all the tarballs or dirs in self.path
     def parse(self):
-        test_result_dirs = []
-        self.mk_extraction_dir()
-        # Handle each entry in log_dir
-        print self.path
+        self.data = []
         for entry in glob.glob(os.path.join(self.path, '*')):
-            # Log tarball
             if fnmatch.fnmatch(os.path.basename(entry), '*.tar.*'):
-                try:
-                    self.logger.debug("Extracting %s" % (entry))
-                    self.extract(entry)
-                except AssertionError, e:
-                    self.logger.warning("Failed to extract %s. Skipping..." % (entry))
-            # Log dir
-            elif os.isdir(entry):
-                test_result_dirs.append(entry)
+                p = TestsuiteLogTarball(entry)
+            elif os.path.isdir(entry):
+                p = TestsuiteLogDir(entry)
             else:
                 self.logger.warning("Unknown entry '%s'. Skipping..." % (entry))
-        # Handle extracted entries
-        test_result_dirs.extend(glob.glob(os.path.join(self.extraction_dir, '*')))
-        # Parse each dir
-        for entry in test_result_dirs:
-            result_file = os.path.join(entry, self.RESULT_FILE_NAME)
-            if not os.access(result_file, os.R_OK):
-                self.logger.error("Failed to read test result: %s" % (result_file))
-                continue
-            # Create ResultFileParser for each file
-            testsuite = {}
-            result_parser = ResultFileParser(result_file, self.logger)
             try:
-                testsuite['testcases'] = result_parser.parse()
+                p.parse()
             except Exception, e:
-                self.logger.error("Failed to parse %s: %s" % (result_file, e))
-                continue
-            testsuite['name'] = self.get_testsuite_name(entry)
-            testsuite['timestamp'] = self.get_testsuite_timestamp(entry)
-            self.testsuites.append(testsuite)
-        return self.testsuites
+                self.logger.warning("Failed to parser %s. Skipping..." % (entry))
+            if isinstance(p.data, list):
+                self.data.extend(p.data)
+            else:
+                self.data.append(p.data)
+        return self.data
 
 
 class Result2Junit(object):
@@ -223,8 +288,7 @@ if __name__ == '__main__':
     logger = logging.getLogger('junit_gen')
     logger.setLevel(logging.DEBUG)
 
-    read_with_encoding('~/a.txt')
+    parser = LogsParser('/var/log/qaset/log')
+    parser.parse()
+    print json.dumps(parser.data, sort_keys=True, indent=4, separators=(',', ': '))
 
-    #parser = TestsuitesParser('~/log', logger)
-    #data = parser.parse()
-    #print json.dumps(data, sort_keys=True, indent=4, separators=(',', ': '))
