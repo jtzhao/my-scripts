@@ -1,6 +1,6 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
-import datetime
+from datetime import timedelta, datetime
 import fnmatch
 import glob
 import json
@@ -10,125 +10,183 @@ from optparse import OptionParser
 import random
 import re
 import shutil
+import sys
 import subprocess
 import uuid
+import socket
+import xml.dom.minidom as MINIDOM
+import xml.etree.ElementTree as ET
 
-try:
-    import xml.etree.cElementTree as ET
-except ImportError:
-    import xml.etree.ElementTree as ET
+### Hack the ET module to support CDATA tag ###
+def CDATA(text=None):
+    element = ET.Element('![CDATA[')
+    element.text = text
+    return element
 
+ET._original_serialize_xml = ET._serialize_xml
 
+def _serialize_xml(write, elem, encoding, qnames, namespaces):
+    if elem.tag == '![CDATA[':
+        tail = '' if elem.tail is None else elem.tail
+        s = "<%s%s\n]]>%s" % (elem.tag, elem.text, tail)
+        write(s)
+        return
+    return ET._original_serialize_xml(write, elem, encoding, qnames, namespaces)
+
+ET._serialize_xml = ET._serialize['xml'] = _serialize_xml
+
+### Utils functions ###
+# Expand ~ and env vars of a path and return its absolute path
+def expand_path(path):
+    path = os.path.expanduser(path)
+    path = os.path.expandvars(path)
+    path = os.path.abspath(path)
+    return path
 
 class BaseParser(object):
-    '''Base class of parser classes'''
-    def __init__(self, logger=None):
+    '''
+    Base class of parser classes
+    '''
+    def __init__(self, path, logger=None):
+        self.path = expand_path(path)
         if logger is None:
             self.logger = logging.getLogger(self.__class__.__name__)
         else:
             self.logger = logger
-
-    # Expand ~ and env vars of a path and return its absolute path
-    def expand_path(self, path):
-        path = os.path.expanduser(path)
-        path = os.path.expandvars(path)
-        path = os.path.abspath(path)
-        return path
     
     # Read the last <count> lines from a file
-    # with a specific encoding(default: utf-8).
+    # with a specific encoding(default: UTF-8).
     # Return a unicode object.
-    def read_with_encoding(self, path, encoding='utf-8', count=100, newline='\n'):
-        path = self.expand_path(path)
-        if not os.access(path, os.R_OK):
-            return None
+    def read_with_encoding(self, path, encoding='UTF-8', count=50, newline='\n'):
+        path = expand_path(path)
+        lines = []
         with file(path, 'rb') as f:
-            lines = f.readlines()
-        if isinstance(count, int):
-            if count <= 0:
-                raise ValueError("count must be larger than 0")
-            lines = lines[-count:]
-        # Remove the trailing \r\n characters
-        def _rstrip(string):
-            return string.rstrip()
-        lines = map(_rstrip, lines)
+            for line in f:
+                if isinstance(count, int) and len(lines) >= count:
+                    lines.pop(0)
+                lines.append(line.strip())
         return unicode(newline.join(lines), encoding)
 
+    def get_result(self):
+        return self.data
 
-class TestsuiteLogDir(BaseParser):
+
+class TestcaseParser(BaseParser):
+    # Read and parse testcase log file
+    # Status/time info are omitted because they're already in test_results file
+    def __init__(self, path, extracted, line_count=50, logger=None):
+        super(self.__class__, self).__init__(path, logger)
+        self.extracted = extracted
+        self.line_count = 50
+        self.data = {'name'         : os.path.basename(path),   # [str] testcase name
+                    'time'          : extracted['time'],        # [int] time used(in seconds)
+                    'status'        : extracted['status'],      # [str] success/failure/error/skipped
+                    'skipped'       : None,                     # [str] Skip message
+                    'failure'       : None,                     # [dict] Example: {'type': 'failure',
+                                                                #                   'message': '3/5 failure', 'text': '...'}
+                    'error'         : None,                     # [dict] Example: {'type': 'error',
+                                                                #                   'message': '2/5 error', 'text': '...'}
+                    'system-out'    : None}                     # [str] log(50 lines by default)
+
+    def parse_log(self):
+        self.data['system-out'] = self.read_with_encoding(self.path, count=self.line_count)
+
+    def parse_skipped(self):
+        if self.extracted['status'] == 'skipped':
+            self.data['skipped'] = '%s/%s skipped' % (extracted)
+
+    def parse_failure_error(self):
+        for status in ['failure', 'error']:
+            if self.extracted[status] > 0:
+                self.data[status] = {'type'     : status,
+                                    'message'   : '%s/%s %s' % (self.extracted[status],
+                                                                self.extracted['count'],
+                                                                status)}
+                self.data[status]['text'] = self.data[status]['message']
+
+    def parse(self):
+        self.parse_log()
+        self.parse_skipped()
+        self.parse_failure_error()
+
+
+class TestsuiteParser(BaseParser):
     '''
-    Parse one test_results file to a dict
+    Parse one test_results file and return a dict
 
     Test result file format:
-        <test_name>                                         # testcase name line
-        <fail> <succeed> <count> <time> <error> <skipped>   # test result line
+        <testcase_name>                                         # testcase name line
+        <failure> <success> <count> <time> <error> <skipped>    # test result line
+
     '''
-    RESULT_ITEMS = ['failed', 'succeeded', 'count', 'time', 'error', 'skipped']
-    TEST_RESULTS = 'test_results'
+    RESULT_ITEMS    = ['failure', 'success', 'count', 'time', 'error', 'skipped']
+    TEST_RESULTS    = 'test_results'
+    ID              = 0
 
-    # path: Path to the log dir.
-    # Example: /usr/share/qa/ctcs2/qa_bzip2-2015-12-18-11-37-53
+    # path: Path to the log dir. Example: /usr/share/qa/ctcs2/qa_bzip2-2015-12-18-11-37-53
     def __init__(self, path, logger=None):
-        super(TestsuiteLogDir, self).__init__(logger)
-        self.data = {'testsuite_name': None,
-                    'timestamp': None,
-                    'testcases': []}
-        self.path = self.expand_path(path)              # path to the log dir
-        self.basename = os.path.basename(self.path)     # name of the log dir
-        self.test_results_file = os.path.join(self.path, self.TEST_RESULTS)
+        super(self.__class__, self).__init__(path, logger)
+        self.data = {'name'     : None,                 # [str] Testsuite name
+                    'tests'     : 0,                    # [int] The amount of tests
+                    'failures'  : 0,                    # [int] The amount of failed tests
+                    'errors'    : 0,                    # [int] The amount of tests with internal errors
+                    'time'      : 0,                    # [int] Time consumed by all its testcases(in seconds)
+                    'skipped'   : 0,                    # [int] The amount of skipped tests
+                    'timestamp' : None,                 # [str] Testsuite start time
+                    'hostname'  : socket.gethostname(), # [str] Hostname
+                    'id'        : TestsuiteParser.ID,   # [int] Sequence number
+                    'testcases' : []}                   # [list] List of testcases
+        TestsuiteParser.ID += 1
+        self.test_results_file = os.path.join(self.path, TestsuiteParser.TEST_RESULTS)
 
-    # Parse dir name to get testsuite name and timestamp
-    def parse_name_timestamp(self):
-        m = re.search(r'(.*)-(\d+(?:-\d+){5})', self.basename)
-        if m is None:
-            return None
-        self.data['testsuite_name'] = m.group(1)
+    # Parse dir name to get testsuite name
+    def parse_testsuite_name_timestamp(self):
+        basename = os.path.basename(self.path)
+        m = re.search(r'(.*)-(\d+(?:-\d+){5})', basename)
+        assert m is not None, "Invalid directory name: %s" % (basename)
+        # Name
+        self.data['name'] = re.sub(r'^qa[_\-]', '', m.group(1))   # Remove prefix: qa_
+        # Timestamp
         lst = m.group(2).split('-')
         date = '-'.join(lst[:3])
         time = ':'.join(lst[-3:])
-        self.data['timestamp'] = "%s %s" % (date, time)
-        return self.data['testsuite_name'], self.data['timestamp']
+        self.data['timestamp'] = "%sT%s" % (date, time)
 
     # Parse test result line and return a dict.
     # A test result line contains 6 numbers:
-    #   <fail> <succeed> <count> <time> <error> <skipped>
+    #   <failure> <succeed> <count> <time> <error> <skipped>
+    # 
+    # Return: {'status': <status>, }
     def extract_result_line(self, line):
-        if not re.search(r'\d+(\s+\d+){5}', line):
-            raise ValueError("Invalid result line: %s" % (line))
-        nums = map(int, line.split())
-        result = {}
-        for i in range(len(self.RESULT_ITEMS)):
-            result[self.RESULT_ITEMS[i]] = nums[i]
-        return result
+        m = re.search(r'\d+(\s+\d+){5}', line) 
+        assert m is not None, "Invalid result line: %s" % (line)
+        nums = line.split()
+        nums = map(int, nums)
+        assert nums[2] > 0, "No tests found: %s" % (line)
+        status = None
+        for i in [0, 4, 1, 5]:
+            if nums[i] > 0:
+                status = TestsuiteParser.RESULT_ITEMS[i]
+        extracted_data = {'status': status}
+        for i in range(len(TestsuiteParser.RESULT_ITEMS)):
+            extracted_data[TestsuiteParser.RESULT_ITEMS[i]] = nums[i]
+        return extracted_data
 
-    # Get testcase timestamp from its log
-    def extract_testcase_timestamp(self, testcase_log):
-        m = re.search(r'^(\w+ \w+ \d+ (?:\d+:){2}\d+ \w+ \d+):', testcase_log, re.MULTILINE)
-        if m is None:
-            return None
-        try:
-            d = datetime.datetime.strptime(m.group(1), '%a %b %d %H:%M:%S %Z %Y')
-            timestamp = d.strftime('%Y-%m-%d %H:%M:%S')
-        except ValueError, e:
-            timestamp = m.group(1)
-        return timestamp
-
-    # Read and parse the test_results file
+    # Parse the test_results file
     # and save the result to self.data['testcases']
-    #               [{'name'      : <testcase name>,
+    #               [{'name'    : <testcase name>,
     #               'failed'    : 0,
     #               'succeeded' : 2,
     #               'count'     : 2,
     #               'time'      : 10,
     #               'error'     : 0,
-    #               'skipped'   : 0,
+    #               'skipped'   : 0},
     #               'log'       : <100 lines of the log>}]
     def parse_testcases(self):
         self.data['testcases'] = []
         testcase_name = ''
         line_num = 0
         self.logger.debug("Parsing file %s" % (self.test_results_file))
-        assert os.access(self.test_results_file, os.R_OK), "Failed to read %s" % (self.test_results_file)
         with file(self.test_results_file, 'r') as f:
             # Parse test_results file line by line
             for line in f:
@@ -138,45 +196,40 @@ class TestsuiteLogDir(BaseParser):
                 if line_num % 2 == 1:
                     testcase_name = line
                     self.logger.debug("Parsing testcase %s" % (testcase_name))
-                    assert len(testcase_name) != 0, "Invalid format(%s:%s)" % (self.test_results_file, line_num)
+                    assert len(testcase_name) != 0, "[%s:%s]Invalid format" % (self.test_results_file, line_num)
                     continue
                 # Test result line
                 self.logger.debug("Getting results of testcase %s" % (testcase_name))
                 try:
-                    testcase = self.extract_result_line(line)
-                except ValueError, e:
-                    self.logger.error("Invalid test result line(%s:%s)" % (self.test_results_file, line_num))
+                    extracted = self.extract_result_line(line)
+                except Exception, e:
+                    self.logger.error("[%s:%s]Invalid format" % (self.test_results_file, line_num))
                     raise e
-                testcase['testcase_name'] = testcase_name
-                log_file_path = os.path.join(os.path.dirname(self.test_results_file), testcase_name)
-                testcase['log'] = self.read_with_encoding(log_file_path)
-                testcase['timestamp'] = self.extract_testcase_timestamp(testcase['log'])
-                self.data['testcases'].append(testcase)
-                # Reset testcase name
+                tp = TestcaseParser(os.path.join(self.path, testcase_name), extracted, logger=self.logger)
+                tp.parse()
+                testcase_data = tp.get_result()
+                self.data['testcases'].append(testcase_data)
+                # Statistics for testsuite
+                self.data['time'] += testcase_data['time']
+                self.data['tests'] += 1
+                tmp = {'failure'    : 'failures',
+                        'error'     : 'errors',
+                        'skipped'   : 'skipped'}
+                for k, v in tmp.items():
+                    if testcase_data['status'] == k:
+                        self.data[v] += 1
+                # Prepare for next loop
                 testcase_name = ''
         assert line_num % 2 == 0, ("No test result of testcase '%s'(%s:%s)" %
                                 (testcase_name, self.test_results_file, line_num))
-        return self.data['testcases']
 
     # Parse all the data.
-    # Return:
-    # { 'testcases': [{'name'      : <testcase name>,
-    #               'failed'    : 0,
-    #               'succeeded' : 2,
-    #               'count'     : 2,
-    #               'time'      : 10,
-    #               'error'     : 0,
-    #               'skipped'   : 0,
-    #               'log'       : <100 lines of the log>}],
-    #   'name': <testsuite_name>,
-    #   'timestamp': <timestamp>    }
     def parse(self):
-        self.parse_name_timestamp()
+        self.parse_testsuite_name_timestamp()
         self.parse_testcases()
-        return self.data
 
 
-class TestsuiteLogTarball(BaseParser):
+class TestsuiteTarballParser(BaseParser):
     '''
     Extract and parse the logs inside a tarball.
     A tarball may contain multiple testsuite log dirs'''
@@ -186,8 +239,7 @@ class TestsuiteLogTarball(BaseParser):
     # path: Path to the tarball containing logs. Example:
     #       /usr/share/qaset/log/gzip-ACAP2-20151216-20151216T110220.tar.bz2
     def __init__(self, path, logger=None):
-        super(TestsuiteLogTarball, self).__init__(logger)
-        self.path = path
+        super(self.__class__, self).__init__(path, logger)
         self.extraction_dir = None
         self.data = []              # A list of testsuites
 
@@ -197,14 +249,8 @@ class TestsuiteLogTarball(BaseParser):
         dirname = "extracted_logs_%s" % (unique_id)
         extraction_dir = os.path.join(self.TMP_DIR, dirname)
         self.logger.debug("Creating %s" % (extraction_dir))
-        try:
-            os.mkdir(extraction_dir, 0755)
-        except OSError, e:
-            raise OSError("Dir %s already exists: %s" % (extraction_dir, e))
-        except IOError, e:
-            raise IOError("Failed to create %s for extraction: %s" % (extraction_dir, e))
+        os.mkdir(extraction_dir, 0755)
         self.extraction_dir = extraction_dir
-        return self.extraction_dir
 
     # Remove the extraction dir
     def remove_extraction_dir(self):
@@ -221,24 +267,24 @@ class TestsuiteLogTarball(BaseParser):
         ret = subprocess.call(cmd, shell=True)
         assert ret == 0, "Extraction failed: %s" % (cmd)
 
+    # Extract the tarball and parse the files inside it
     def parse(self):
         self.create_extraction_dir()
         self.extract()
         for entry in glob.glob(os.path.join(self.extraction_dir, '*')):
-            p = TestsuiteLogDir(entry, self.logger)
+            p = TestsuiteParser(entry, self.logger)
             try:
-                testsuite = p.parse()
-                self.data.append(testsuite)
+                p.parse()
+                self.data.append(p.get_result())
             except Exception, e:
-                self.logger.warning("Failed to parse %s. Skipping..." % (entry))
+                self.logger.error("Failed to parse %s: %s" % (entry, e))
         self.remove_extraction_dir()
         # Check if there's any data
         if len(self.data) == 0:
             self.logger.warning("No log data in %s" % (self.path))
-        return self.data
 
 
-class LogsParser(BaseParser):
+class TestsuitesParser(BaseParser):
     '''
     Parse all the logs under a directory.
 
@@ -253,42 +299,184 @@ class LogsParser(BaseParser):
     # path: The directory containing log tarballs or log dirs.
     #   Example: /var/log/qaset/log/
     def __init__(self, path, logger=None):
-        super(LogsParser, self).__init__(logger)
-        self.path = path
-        self.data = []          # A list of testsuites data
+        super(self.__class__, self).__init__(path, logger)
+        self.data = {'time'     : 0,        # [int] time used(in seconds)
+                    'tests'     : 0,        # [int] Amount of testsuites
+                    'failures'  : 0,        # [int] Amount of failed testsuites
+                    'errors'    : 0,        # [int] Amount of testsuites with internal errors
+                    'testsuites': []}       # [list] List of testsuites
 
     # Parse all the tarballs or dirs in self.path
     def parse(self):
-        self.data = []
         for entry in glob.glob(os.path.join(self.path, '*')):
             if fnmatch.fnmatch(os.path.basename(entry), '*.tar.*'):
-                p = TestsuiteLogTarball(entry)
+                p = TestsuiteTarballParser(entry, self.logger)
             elif os.path.isdir(entry):
-                p = TestsuiteLogDir(entry)
+                p = TestsuiteParser(entry, self.logger)
             else:
-                self.logger.warning("Unknown entry '%s'. Skipping..." % (entry))
+                self.logger.warning("Unknown entry '%s'" % (entry))
             try:
                 p.parse()
             except Exception, e:
-                self.logger.warning("Failed to parser %s. Skipping..." % (entry))
-            if isinstance(p.data, list):
-                self.data.extend(p.data)
-            else:
-                self.data.append(p.data)
+                self.logger.error("Failed to parse %s: %s" % (entry, e))
+            testsuites_data = p.get_result()
+            if not isinstance(testsuites_data, list):
+                testsuites_data = [testsuites_data]
+            # Statistics for testsuites
+            for testsuite in testsuites_data:
+                self.data['time'] += testsuite['time']
+                self.data['tests'] += 1
+                self.data['failures'] += testsuite['failures']
+                self.data['errors'] += testsuite['errors']
+            self.data['testsuites'].extend(testsuites_data)
         return self.data
 
+class BaseElement(object):
+    def __init__(self, data, tag, parent=None):
+        self.data = data
+        self.elem = ET.Element(tag)
+        if parent is not None:
+            parent.append(self)
 
-class Result2Junit(object):
+    def append(self, elem):
+        if not isinstance(elem, BaseElement):
+            raise TypeError("Cannot append %s as sub element. Type be BaseElement" % (elem.__class__.__name__))
+        self.elem.append(elem.elem)
+
+    def set_attrs(self):
+        for k, v in self.data.items():
+            if not(isinstance(v, list) or
+                    isinstance(v, dict) or
+                    v is None or
+                    k == 'system-out'):
+                if not isinstance(v, basestring):
+                    v = str(v)
+                self.elem.set(k, v)
+
+    def to_pretty_xml(self, encoding='UTF-8', indent='    '):
+        s = ET.tostring(self.elem)
+        parsed = MINIDOM.parseString(s.encode(encoding))
+        return parsed.toprettyxml(indent=indent, encoding=encoding)
+
+
+class TestcaseElement(BaseElement):
+    def __init__(self, testcase_data, parent=None):
+        super(self.__class__, self).__init__(testcase_data,
+                                            'testcase',
+                                            parent)
+        self.convert()
+
+    def convert(self):
+        self.set_attrs()
+        # skipped
+        if self.data['skipped'] is not None:
+            skip_elem = ET.SubElement(self.elem, 'skipped')
+            skip_elem.text = self.data['skipped']
+        # failure & error
+        for key in ['failure', 'error']:
+            if self.data[key] is not None:
+                elem = ET.SubElement(self.elem, key)
+                for attr in ['type', 'message']:
+                    elem.set(attr, self.data[key][attr])
+                elem.text = self.data[key]['text']
+        # system-out
+        out_elem = ET.SubElement(self.elem, 'system-out')
+        cdata_elem = CDATA(self.data['system-out'])
+        out_elem.append(cdata_elem)
+
+
+class TestsuiteElement(BaseElement):
+    def __init__(self, testsuite_data, parent=None):
+        super(self.__class__, self).__init__(testsuite_data,
+                                            'testsuite',
+                                            parent)
+        self.convert()
+
+    def convert(self):
+        self.set_attrs()
+        for testcase_data in self.data['testcases']:
+            TestcaseElement(testcase_data, parent=self)
+
+
+class TestsuitesElement(BaseElement):
+    def __init__(self, testsuite_data, parent=None):
+        super(self.__class__, self).__init__(testsuite_data,
+                                            'testsuite',
+                                            parent)
+        self.convert()
+
+    def convert(self):
+        self.set_attrs()
+        for testsuite_data in self.data['testsuites']:
+            TestsuiteElement(testsuite_data, parent=self)
+
+
+class JunitConverter(object):
+    '''
+    Convert testsuites data to junit format
+    '''
     def __init__(self):
-        pass
+        self.root = None
+        self.encoding = None
+
+    def __str__(self):
+        return self.root.to_pretty_xml(self.encoding)
+
+    def load(self, parsed_data, encoding='UTF-8'):
+        self.root = TestsuitesElement(parsed_data)
+        self.encoding = encoding
+
+    def dump(self, file_like_or_io):
+        file_like_or_io.write(str(self))
 
 
 if __name__ == '__main__':
+    # Parse cmd line options
+    usage = '''Usage: %prog [options] log_dir [submission_dir]
+
+  Arguments:
+    log_dir             QA log dir. Default: /var/log/qaset/log
+    submission_dir      Log submission dir(optional). Default: /var/log/qaset/submission
+
+  Options:
+    -o|--output         Write xml to file instead of STDOUT
+    -d|--debug          Enable debug mode
+    -e|--encoding       xml encoding. Default: UTF-8
+'''
+    op = OptionParser(usage=usage)
+    op.add_option('-o', '--output', dest='file', type='string',
+                help='Save xml to file')
+    op.add_option('-d', '--debug', action="store_true", dest="debug",
+                help='Enable debug mode')
+    op.add_option('-e', '--encoding', dest="encoding", default='UTF-8',
+                help='Set xml encoding')
+    (options, args) = op.parse_args()
+    try:
+        assert len(args) >= 1
+        assert len(args) < 3
+    except AssertionError, e:
+        op.print_usage()
+        exit(255)
+    log_dir = expand_path(args[0])
+    submission_dir = expand_path(args[1]) if len(args) == 2 else None
+    # Logger
     logging.basicConfig(format='[%(name)s]%(levelname)s: %(message)s')
-    logger = logging.getLogger('junit_gen')
-    logger.setLevel(logging.DEBUG)
-
-    parser = LogsParser('/var/log/qaset/log')
+    logger = logging.getLogger(__file__)
+    level = logging.DEBUG if options.debug else logging.INFO
+    logger.setLevel(level)
+    # Output file
+    if options.file:
+        try:
+            outfile = file(options.file, 'w')
+        except Exception, e:
+            logger.error("Failed to create output file %s: %s" % (options.file, e))
+            exit(1)
+    else:
+        outfile = sys.stdout
+    # Parse logs
+    parser = TestsuitesParser(log_dir, logger)
     parser.parse()
-    print json.dumps(parser.data, sort_keys=True, indent=4, separators=(',', ': '))
-
+    # Convert to xml
+    converter = JunitConverter()
+    converter.load(parser.get_result())
+    converter.dump(outfile)
