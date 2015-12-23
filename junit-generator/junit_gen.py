@@ -18,24 +18,6 @@ import traceback
 import xml.dom.minidom as MINIDOM
 import xml.etree.ElementTree as ET
 
-### Hack the ET module to support CDATA tag ###
-def CDATA(text=None):
-    element = ET.Element('![CDATA[')
-    element.text = text
-    return element
-
-ET._original_serialize_xml = ET._serialize_xml
-
-def _serialize_xml(write, elem, encoding, qnames, namespaces):
-    if elem.tag == '![CDATA[':
-        tail = '' if elem.tail is None else elem.tail
-        s = "<%s%s\n]]>%s" % (elem.tag, elem.text, tail)
-        write(s)
-        return
-    return ET._original_serialize_xml(write, elem, encoding, qnames, namespaces)
-
-ET._serialize_xml = ET._serialize['xml'] = _serialize_xml
-
 ### Utils functions ###
 # Expand ~ and env vars of a path and return its absolute path
 def expand_path(path):
@@ -44,9 +26,34 @@ def expand_path(path):
     path = os.path.abspath(path)
     return path
 
+# Detect raw string encoding and convert it to unicode object
+# Note: This function uses chardet lib to detect encoding,
+#       but should work as well without it
+def str_to_unicode(raw_str):
+    try:
+        # Use chardet to detect encoding
+        import chardet
+        res = chardet.detect(raw_str)
+        print res
+        return unicode(raw_str, res['encoding'])
+    except:
+        # Try all possible encodings
+        for encoding in ['UTF-8', 'ASCII', 'UTF-16', 'UTF-32',                  # ASCII and unicode
+                        'Big5', 'GBK',                                          # Chinese
+                        'ISO-8859-5', 'windows-1251',                           # Bulgarian
+                        'windows-1252', 'latin-1',                              # English
+                        'ISO-8859-16',                                          # German
+                        'ISO-8859-2', 'windows-1250',                           # Hungarian
+                        'ISO-8859-5', 'windows-1251',                           # Cyrillic
+                        'ISO-8859-7', 'windows-1253']:                          # Greek
+            try:
+                return unicode(raw_str, encoding)
+            except:
+                continue
+    raise ValueError("Unknown encoding: %s" % (raw_str))
+
 # Read the last <count> lines from a file
-# with a specific encoding(default: UTF-8).
-# Return a unicode object.
+# and return a unicode object.
 def read_with_encoding(path, count=50, newline='\n'):
     path = expand_path(path)
     lines = []
@@ -55,11 +62,85 @@ def read_with_encoding(path, count=50, newline='\n'):
             if isinstance(count, int) and len(lines) >= count:
                 lines.pop(0)
             lines.append(line.strip())
-    # Try all possible encodings
-    for encoding in ['UTF-8', 'ASCII', 'UTF-16', 'UTF-32',
-                    ]
-    return unicode(newline.join(lines), encoding)
+    raw_data = newline.join(lines)
+    return str_to_unicode(raw_data)
 
+
+###### xml.etree.ElementTree Hack ######
+# Hack xml.etree.ElementTree to support CDATA tag
+# Generate a CDATA element
+def CDATA(text=None):
+    element = ET.Element('![CDATA[')
+    element.text = text
+    return element
+
+# Hack xml.etree.ElementTree to generate pretty xml
+def _serialize_xml(write, elem, encoding, qnames, namespaces, level=0):
+    def _indent_gen(i):
+        return ' ' * (2 * i)
+    tag = elem.tag
+    text = elem.text
+    if tag == '![CDATA[':
+        # CDATA. Do NOT escape special characters
+        write("<%s%s\n]]>\n" % (tag, str_to_unicode(text).encode(encoding)))
+    elif tag is ET.Comment:
+        write("%s<!--%s-->\n" % (_indent_gen(level),
+                                ET._encode(text, encoding)))
+    elif tag is ET.ProcessingInstruction:
+        write("%s<?%s?>\n" % (_indent_gen(level),
+                                ET._encode(text, encoding)))
+    else:
+        tag = qnames[tag]
+        if tag is None:
+            if text:
+                string = ET._escape_cdata(text, encoding)
+                if len(elem) > 0:
+                    string = "%s%s\n" % (_indent_gen(level+1), string)
+                write(string)
+            for e in elem:
+                _serialize_xml(write, e, encoding, qnames, None, level+1)
+        else:
+            write("%s<%s" % (_indent_gen(level+1), tag))
+            items = elem.items()
+            if items or namespaces:
+                if namespaces:
+                    for v, k in sorted(namespaces.items(),
+                                       key=lambda x: x[1]):  # sort on prefix
+                        if k:
+                            k = ":" + k
+                        write(" xmlns%s=\"%s\"" % (
+                            k.encode(encoding),
+                            ET._escape_attrib(v, encoding)
+                            ))
+                for k, v in sorted(items):  # lexical order
+                    if isinstance(k, ET.QName):
+                        k = k.text
+                    if isinstance(v, ET.QName):
+                        v = qnames[v.text]
+                    else:
+                        v = ET._escape_attrib(v, encoding)
+                    write(" %s=\"%s\"" % (qnames[k], v))
+            if text or len(elem):
+                write(">")
+                if len(elem) > 0:
+                    write("\n")
+                if text:
+                    string = ET._escape_cdata(text, encoding)
+                    if len(elem) > 0:
+                        string = "%s%s\n" % (_indent_gen(level+1), string)
+                    write(string)
+                for e in elem:
+                    _serialize_xml(write, e, encoding, qnames, None, level+1)
+                write("%s</%s>\n" % (_indent_gen(level+1), tag))
+            else:
+                write(" />\n")
+    if elem.tail:
+        write("%s%s\n" % (_indent_gen(level),
+                            ET._escape_cdata(elem.tail, encoding)))
+
+ET._serialize_xml = ET._serialize['xml'] = _serialize_xml
+
+### Utils functions ###
 
 class BaseParser(object):
     '''
@@ -389,8 +470,13 @@ class BaseElement(object):
 
     def to_pretty_xml(self, encoding='UTF-8', indent='    '):
         s = ET.tostring(self.elem)
-        parsed = MINIDOM.parseString(s.encode(encoding))
-        return parsed.toprettyxml(indent=indent, encoding=encoding)
+        #parsed = MINIDOM.parseString(s.encode(encoding))
+        #parsed = MINIDOM.parseString(s.encode('ascii'))
+        #return parsed.toprettyxml(indent=indent, encoding=encoding)
+        f = file('/home/snowwolf/test.xml', 'w')
+        f.write(s.encode('UTF-8'))
+        f.close()
+        return s
 
 
 class TestcaseElement(BaseElement):
