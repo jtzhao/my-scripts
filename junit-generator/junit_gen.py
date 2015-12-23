@@ -95,7 +95,7 @@ class TestcaseParser(BaseParser):
 
     def parse_skipped(self):
         if self.extracted['status'] == 'skipped':
-            self.data['skipped'] = '%s/%s skipped' % (extracted['skipped'], extracted['count'])
+            self.data['skipped'] = '%s/%s skipped' % (self.extracted['skipped'], self.extracted['count'])
 
     def parse_failure_error(self):
         for status in ['failure', 'error']:
@@ -457,7 +457,8 @@ class JunitConverter(object):
     def __init__(self, log_dir, submission_dir=None, encoding='UTF-8', logger=None):
         self.log_dir = expand_path(log_dir)
         if submission_dir is not None:
-            self.submission_dir = expand_path(submission_dir)
+            submission_dir = expand_path(submission_dir)
+        self.submission_dir = submission_dir
         self.root = None
         self.encoding = encoding
         self.logger = logger
