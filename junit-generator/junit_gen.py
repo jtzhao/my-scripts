@@ -454,9 +454,10 @@ class JunitConverter(object):
     '''
     Convert testsuites data to junit format
     '''
-    def __init__(self, log_dir, submission_dir, encoding='UTF-8', logger=None):
+    def __init__(self, log_dir, submission_dir=None, encoding='UTF-8', logger=None):
         self.log_dir = expand_path(log_dir)
-        self.submission_dir = expand_path(submission_dir)
+        if submission_dir is not None:
+            self.submission_dir = expand_path(submission_dir)
         self.root = None
         self.encoding = encoding
         self.logger = logger
@@ -467,15 +468,18 @@ class JunitConverter(object):
     def set_encoding(self, encoding):
         self.encoding = encoding
 
-    def convert(self, parsed_data):
+    def run(self):
         # Parse log files
         log_parser = TestsuitesParser(self.log_dir, self.logger)
         log_parser.parse()
         log_data = log_parser.get_result()
         # Parse submission files
-        submission_parser = SubmissionParser(self.submission_dir, self.logger)
-        submission_parser.parse()
-        submission_data = submission_parser.get_result()
+        if self.submission_dir is None:
+            submission_parser = SubmissionParser(self.submission_dir, self.logger)
+            submission_parser.parse()
+            submission_data = submission_parser.get_result()
+        else:
+            submission_data = {}
         # Add submission id and link to log_data
         for testsuite in log_data['testsuites']:
             d = submission_data.get(testsuite['name'], {})
@@ -532,10 +536,10 @@ if __name__ == '__main__':
             exit(1)
     else:
         outfile = sys.stdout
-    # Parse logs
-    parser = TestsuitesParser(log_dir, logger)
-    parser.parse()
     # Convert to xml
-    converter = JunitConverter()
-    converter.load(parser.get_result())
+    converter = JunitConverter(log_dir,
+                                submission_dir=submission_dir,
+                                encoding=options['encoding'],
+                                logger=logger)
+    converter.run()
     converter.dump(outfile)
