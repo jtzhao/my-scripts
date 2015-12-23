@@ -14,7 +14,7 @@ import sys
 import subprocess
 import uuid
 import socket
-import trackback
+import traceback
 import xml.dom.minidom as MINIDOM
 import xml.etree.ElementTree as ET
 
@@ -289,6 +289,31 @@ class TestsuiteTarballParser(BaseParser):
             self.logger.warning("No log data in %s" % (self.path))
 
 
+class SubmissionParser(BaseParser):
+    '''
+    Parse all submission logs to get submission ids and links.
+    '''
+
+    def __init__(self, path, logger=None):
+        super(self.__class__, self).__init__(path, logger)
+        self.data = {}  # A list containing all the submission links and ids
+
+    def parse_submission(self, submission_file_path, encoding='UTF-8'):
+        s = read_with_encoding(submission_file_path, encoding=encoding)
+        m = re.search(r'ID (\d+): (.*)$', s, re.MULTILINE | re.IGNORECASE)
+        assert m is not None, "No submission id/link found: %s" % (submission_file_path)
+        self.data[testsuite_name] = {'id': m.group(1), 'link': m.group(2)}
+
+    def parse(self):
+        self.data = {}
+        for entry in glob.glob(os.path.join(self.path, 'submission-*.log')):
+            if os.path.isfile(entry):
+                try:
+                    self.parse_submission(entry)
+                except AssertionError, e:
+                    self.logger.warning("%s" % e)
+
+
 class TestsuitesParser(BaseParser):
     '''
     Parse all the logs under a directory.
@@ -398,8 +423,16 @@ class TestsuiteElement(BaseElement):
                                             parent)
         self.convert()
 
+    def set_properties(self):
+        properties_elem = ET.SubElement(self.elem, 'properties')
+        for k, v in self.data['properties']:
+            property_elem = ET.SubElement(properties_elem,
+                                        'property',
+                                        attrib={'name': k, 'value': v})
+
     def convert(self):
         self.set_attrs()
+        self.set_properties()
         for testcase_data in self.data['testcases']:
             TestcaseElement(testcase_data, parent=self)
 
@@ -421,16 +454,35 @@ class JunitConverter(object):
     '''
     Convert testsuites data to junit format
     '''
-    def __init__(self):
+    def __init__(self, log_dir, submission_dir, encoding='UTF-8', logger=None):
+        self.log_dir = expand_path(log_dir)
+        self.submission_dir = expand_path(submission_dir)
         self.root = None
-        self.encoding = None
+        self.encoding = encoding
+        self.logger = logger
 
     def __str__(self):
         return self.root.to_pretty_xml(self.encoding)
 
-    def load(self, parsed_data, encoding='UTF-8'):
-        self.root = TestsuitesElement(parsed_data)
+    def set_encoding(self, encoding):
         self.encoding = encoding
+
+    def convert(self, parsed_data):
+        # Parse log files
+        log_parser = TestsuitesParser(self.log_dir, self.logger)
+        log_parser.parse()
+        log_data = log_parser.get_result()
+        # Parse submission files
+        submission_parser = SubmissionParser(self.submission_dir, self.logger)
+        submission_parser.parse()
+        submission_data = submission_parser.get_result()
+        # Add submission id and link to log_data
+        for testsuite in log_data['testsuites']:
+            d = submission_data.get(testsuite['name'], {})
+            testsuite['properties'] = { 'submission_id': d.get('id', ''),
+                                        'submission_link': d.get('link', '')}
+        # Create xml tree 
+        self.root = TestsuitesElement(log_data)
 
     def dump(self, file_like_or_io):
         file_like_or_io.write(str(self))
