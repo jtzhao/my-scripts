@@ -539,7 +539,7 @@ if __name__ == '__main__':
     # Convert to xml
     converter = JunitConverter(log_dir,
                                 submission_dir=submission_dir,
-                                encoding=options['encoding'],
+                                encoding=options.encoding,
                                 logger=logger)
     converter.run()
     converter.dump(outfile)
