@@ -47,7 +47,7 @@ def expand_path(path):
 # Read the last <count> lines from a file
 # with a specific encoding(default: UTF-8).
 # Return a unicode object.
-def read_with_encoding(path, encoding='UTF-8', count=50, newline='\n'):
+def read_with_encoding(path, count=50, newline='\n'):
     path = expand_path(path)
     lines = []
     with file(path, 'rb') as f:
@@ -55,6 +55,9 @@ def read_with_encoding(path, encoding='UTF-8', count=50, newline='\n'):
             if isinstance(count, int) and len(lines) >= count:
                 lines.pop(0)
             lines.append(line.strip())
+    # Try all possible encodings
+    for encoding in ['UTF-8', 'ASCII', 'UTF-16', 'UTF-32',
+                    ]
     return unicode(newline.join(lines), encoding)
 
 
@@ -298,8 +301,8 @@ class SubmissionParser(BaseParser):
         super(self.__class__, self).__init__(path, logger)
         self.data = {}  # A list containing all the submission links and ids
 
-    def parse_submission(self, submission_file_path, encoding='UTF-8'):
-        s = read_with_encoding(submission_file_path, encoding=encoding)
+    def parse_submission(self, submission_file_path):
+        s = read_with_encoding(submission_file_path)
         m = re.search(r'ID (\d+): (.*)$', s, re.MULTILINE | re.IGNORECASE)
         assert m is not None, "No submission id/link found: %s" % (submission_file_path)
         self.data[testsuite_name] = {'id': m.group(1), 'link': m.group(2)}
@@ -425,7 +428,7 @@ class TestsuiteElement(BaseElement):
 
     def set_properties(self):
         properties_elem = ET.SubElement(self.elem, 'properties')
-        for k, v in self.data['properties']:
+        for k, v in self.data['properties'].items():
             property_elem = ET.SubElement(properties_elem,
                                         'property',
                                         attrib={'name': k, 'value': v})
@@ -476,11 +479,11 @@ class JunitConverter(object):
         log_data = log_parser.get_result()
         # Parse submission files
         if self.submission_dir is None:
+            submission_data = {}
+        else:
             submission_parser = SubmissionParser(self.submission_dir, self.logger)
             submission_parser.parse()
             submission_data = submission_parser.get_result()
-        else:
-            submission_data = {}
         # Add submission id and link to log_data
         for testsuite in log_data['testsuites']:
             d = submission_data.get(testsuite['name'], {})
