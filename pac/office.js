@@ -5,6 +5,7 @@ var domains_via_proxy = [
     "*.novell.*",
     "*nytimes.com",
     "*.suse.*",
+    "*.de",
 ];
 
 var ips_via_proxy = [

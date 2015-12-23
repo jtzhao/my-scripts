@@ -14,6 +14,7 @@ import sys
 import subprocess
 import uuid
 import socket
+import trackback
 import xml.dom.minidom as MINIDOM
 import xml.etree.ElementTree as ET
 
@@ -43,6 +44,20 @@ def expand_path(path):
     path = os.path.abspath(path)
     return path
 
+# Read the last <count> lines from a file
+# with a specific encoding(default: UTF-8).
+# Return a unicode object.
+def read_with_encoding(path, encoding='UTF-8', count=50, newline='\n'):
+    path = expand_path(path)
+    lines = []
+    with file(path, 'rb') as f:
+        for line in f:
+            if isinstance(count, int) and len(lines) >= count:
+                lines.pop(0)
+            lines.append(line.strip())
+    return unicode(newline.join(lines), encoding)
+
+
 class BaseParser(object):
     '''
     Base class of parser classes
@@ -54,19 +69,6 @@ class BaseParser(object):
         else:
             self.logger = logger
     
-    # Read the last <count> lines from a file
-    # with a specific encoding(default: UTF-8).
-    # Return a unicode object.
-    def read_with_encoding(self, path, encoding='UTF-8', count=50, newline='\n'):
-        path = expand_path(path)
-        lines = []
-        with file(path, 'rb') as f:
-            for line in f:
-                if isinstance(count, int) and len(lines) >= count:
-                    lines.pop(0)
-                lines.append(line.strip())
-        return unicode(newline.join(lines), encoding)
-
     def get_result(self):
         return self.data
 
@@ -89,11 +91,11 @@ class TestcaseParser(BaseParser):
                     'system-out'    : None}                     # [str] log(50 lines by default)
 
     def parse_log(self):
-        self.data['system-out'] = self.read_with_encoding(self.path, count=self.line_count)
+        self.data['system-out'] = read_with_encoding(self.path, count=self.line_count)
 
     def parse_skipped(self):
         if self.extracted['status'] == 'skipped':
-            self.data['skipped'] = '%s/%s skipped' % (extracted)
+            self.data['skipped'] = '%s/%s skipped' % (extracted['skipped'], extracted['count'])
 
     def parse_failure_error(self):
         for status in ['failure', 'error']:
@@ -204,6 +206,7 @@ class TestsuiteParser(BaseParser):
                     extracted = self.extract_result_line(line)
                 except Exception, e:
                     self.logger.error("[%s:%s]Invalid format" % (self.test_results_file, line_num))
+                    self.logger.debug(traceback.format_exc())
                     raise e
                 tp = TestcaseParser(os.path.join(self.path, testcase_name), extracted, logger=self.logger)
                 tp.parse()
@@ -258,6 +261,7 @@ class TestsuiteTarballParser(BaseParser):
             shutil.rmtree(self.extraction_dir)
         except OSError, e:
             self.logger.warning("Unable to remove extraction dir %s.\nMaybe it's already removed?" % (self.extraction_dir))
+            self.logger.debug(traceback.format_exc())
         self.extraction_dir = None
 
     # Extract a tarball to self.extraction_dir
@@ -278,6 +282,7 @@ class TestsuiteTarballParser(BaseParser):
                 self.data.append(p.get_result())
             except Exception, e:
                 self.logger.error("Failed to parse %s: %s" % (entry, e))
+                self.logger.debug(traceback.format_exc())
         self.remove_extraction_dir()
         # Check if there's any data
         if len(self.data) == 0:
@@ -319,6 +324,7 @@ class TestsuitesParser(BaseParser):
                 p.parse()
             except Exception, e:
                 self.logger.error("Failed to parse %s: %s" % (entry, e))
+                self.logger.debug(traceback.format_exc())
             testsuites_data = p.get_result()
             if not isinstance(testsuites_data, list):
                 testsuites_data = [testsuites_data]
@@ -470,6 +476,7 @@ if __name__ == '__main__':
             outfile = file(options.file, 'w')
         except Exception, e:
             logger.error("Failed to create output file %s: %s" % (options.file, e))
+            self.logger.debug(traceback.format_exc())
             exit(1)
     else:
         outfile = sys.stdout
