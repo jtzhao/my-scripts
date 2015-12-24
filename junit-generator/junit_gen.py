@@ -34,17 +34,16 @@ def str_to_unicode(raw_str):
         # Use chardet to detect encoding
         import chardet
         res = chardet.detect(raw_str)
-        print res
         return unicode(raw_str, res['encoding'])
     except:
         # Try all possible encodings
-        for encoding in ['UTF-8', 'ASCII', 'UTF-16', 'UTF-32',                  # ASCII and unicode
-                        'Big5', 'GBK',                                          # Chinese
-                        'ISO-8859-5', 'windows-1251',                           # Bulgarian
+        for encoding in ['UTF-8', 'ASCII',                                      # ASCII and unicode
                         'windows-1252', 'latin-1',                              # English
+                        'ISO-8859-5', 'windows-1251',                           # Bulgarian
                         'ISO-8859-16',                                          # German
                         'ISO-8859-2', 'windows-1250',                           # Hungarian
                         'ISO-8859-5', 'windows-1251',                           # Cyrillic
+                        'Big5', 'GBK',                                          # Chinese
                         'ISO-8859-7', 'windows-1253']:                          # Greek
             try:
                 return unicode(raw_str, encoding)
@@ -52,19 +51,15 @@ def str_to_unicode(raw_str):
                 continue
     raise ValueError("Unknown encoding: %s" % (raw_str))
 
-# Read the last <count> lines from a file
-# and return a unicode object.
-def read_with_encoding(path, count=50, newline='\n'):
+def read_last_lines(path, count=50):
     path = expand_path(path)
     lines = []
-    with file(path, 'rb') as f:
+    with file(path, 'r') as f:
         for line in f:
             if isinstance(count, int) and len(lines) >= count:
                 lines.pop(0)
             lines.append(line.strip())
-    raw_data = newline.join(lines)
-    return str_to_unicode(raw_data)
-
+    return os.linesep.join(lines)
 
 ###### xml.etree.ElementTree Hack ######
 # Hack xml.etree.ElementTree to support CDATA tag
@@ -82,7 +77,8 @@ def _serialize_xml(write, elem, encoding, qnames, namespaces, level=0):
     text = elem.text
     if tag == '![CDATA[':
         # CDATA. Do NOT escape special characters
-        write("<%s%s\n]]>\n" % (tag, str_to_unicode(text).encode(encoding)))
+        u = str_to_unicode(text)
+        write("<%s%s\n]]>\n" % (tag, u.encode(encoding)))
     elif tag is ET.Comment:
         write("%s<!--%s-->\n" % (_indent_gen(level),
                                 ET._encode(text, encoding)))
@@ -100,7 +96,7 @@ def _serialize_xml(write, elem, encoding, qnames, namespaces, level=0):
             for e in elem:
                 _serialize_xml(write, e, encoding, qnames, None, level+1)
         else:
-            write("%s<%s" % (_indent_gen(level+1), tag))
+            write("%s<%s" % (_indent_gen(level), tag))
             items = elem.items()
             if items or namespaces:
                 if namespaces:
@@ -131,7 +127,10 @@ def _serialize_xml(write, elem, encoding, qnames, namespaces, level=0):
                     write(string)
                 for e in elem:
                     _serialize_xml(write, e, encoding, qnames, None, level+1)
-                write("%s</%s>\n" % (_indent_gen(level+1), tag))
+                string = "</%s>\n" % tag
+                if len(elem) > 0:
+                    string = "%s%s" % (_indent_gen(level), string)
+                write(string)
             else:
                 write(" />\n")
     if elem.tail:
@@ -140,7 +139,6 @@ def _serialize_xml(write, elem, encoding, qnames, namespaces, level=0):
 
 ET._serialize_xml = ET._serialize['xml'] = _serialize_xml
 
-### Utils functions ###
 
 class BaseParser(object):
     '''
@@ -163,7 +161,7 @@ class TestcaseParser(BaseParser):
     def __init__(self, path, extracted, line_count=50, logger=None):
         super(self.__class__, self).__init__(path, logger)
         self.extracted = extracted
-        self.line_count = 50
+        self.line_count = line_count
         self.data = {'name'         : os.path.basename(path),   # [str] testcase name
                     'time'          : extracted['time'],        # [int] time used(in seconds)
                     'status'        : extracted['status'],      # [str] success/failure/error/skipped
@@ -175,7 +173,7 @@ class TestcaseParser(BaseParser):
                     'system-out'    : None}                     # [str] log(50 lines by default)
 
     def parse_log(self):
-        self.data['system-out'] = read_with_encoding(self.path, count=self.line_count)
+        self.data['system-out'] = read_last_lines(self.path, count=self.line_count)
 
     def parse_skipped(self):
         if self.extracted['status'] == 'skipped':
@@ -292,8 +290,13 @@ class TestsuiteParser(BaseParser):
                     self.logger.error("[%s:%s]Invalid format" % (self.test_results_file, line_num))
                     self.logger.debug(traceback.format_exc())
                     raise e
-                tp = TestcaseParser(os.path.join(self.path, testcase_name), extracted, logger=self.logger)
-                tp.parse()
+                try:
+                    tp = TestcaseParser(os.path.join(self.path, testcase_name), extracted, logger=self.logger)
+                    tp.parse()
+                except Exception, e:
+                    self.logger.error("Failed to parse testcase %s.%s" % (self.data['name'],
+                                                                        testcase_name))
+                    self.logger.debug(traceback.format_exc())
                 testcase_data = tp.get_result()
                 self.data['testcases'].append(testcase_data)
                 # Statistics for testsuite
@@ -382,10 +385,17 @@ class SubmissionParser(BaseParser):
         super(self.__class__, self).__init__(path, logger)
         self.data = {}  # A list containing all the submission links and ids
 
+    def get_testsuite_name(self, submission_file_name):
+        m = re.search(r'^submission-(.*)\.log$', submission_file_name)
+        assert m is not None, "Can't detect testsuite name: %s" % (submission_file_name)
+        return m.group(1)
+
     def parse_submission(self, submission_file_path):
-        s = read_with_encoding(submission_file_path)
+        file_name = os.path.basename(submission_file_path)
+        testsuite_name = self.get_testsuite_name(file_name)
+        s = read_last_lines(submission_file_path, 10)
         m = re.search(r'ID (\d+): (.*)$', s, re.MULTILINE | re.IGNORECASE)
-        assert m is not None, "No submission id/link found: %s" % (submission_file_path)
+        assert m is not None, "No submission id/link found: %s" % (file_name)
         self.data[testsuite_name] = {'id': m.group(1), 'link': m.group(2)}
 
     def parse(self):
@@ -468,15 +478,8 @@ class BaseElement(object):
                     v = str(v)
                 self.elem.set(k, v)
 
-    def to_pretty_xml(self, encoding='UTF-8', indent='    '):
-        s = ET.tostring(self.elem)
-        #parsed = MINIDOM.parseString(s.encode(encoding))
-        #parsed = MINIDOM.parseString(s.encode('ascii'))
-        #return parsed.toprettyxml(indent=indent, encoding=encoding)
-        f = file('/home/snowwolf/test.xml', 'w')
-        f.write(s.encode('UTF-8'))
-        f.close()
-        return s
+    def to_pretty_xml(self, encoding='UTF-8'):
+        return ET.tostring(self.elem, encoding=encoding, method='xml')
 
 
 class TestcaseElement(BaseElement):
@@ -513,6 +516,8 @@ class TestsuiteElement(BaseElement):
         self.convert()
 
     def set_properties(self):
+        if not self.data.has_key('properties'):
+            return
         properties_elem = ET.SubElement(self.elem, 'properties')
         for k, v in self.data['properties'].items():
             property_elem = ET.SubElement(properties_elem,
@@ -529,7 +534,7 @@ class TestsuiteElement(BaseElement):
 class TestsuitesElement(BaseElement):
     def __init__(self, testsuite_data, parent=None):
         super(self.__class__, self).__init__(testsuite_data,
-                                            'testsuite',
+                                            'testsuites',
                                             parent)
         self.convert()
 
@@ -573,8 +578,11 @@ class JunitConverter(object):
         # Add submission id and link to log_data
         for testsuite in log_data['testsuites']:
             d = submission_data.get(testsuite['name'], {})
-            testsuite['properties'] = { 'submission_id': d.get('id', ''),
-                                        'submission_link': d.get('link', '')}
+            submission_id = d.get('id', None)
+            submission_link = d.get('link', None)
+            if submission_id and submission_link:
+                testsuite['properties'] = { 'submission_id': d['id'],
+                                            'submission_link': d['link']}
         # Create xml tree 
         self.root = TestsuitesElement(log_data)
 
