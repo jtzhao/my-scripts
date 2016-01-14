@@ -63,6 +63,10 @@ class Testrun(object):
     # Use screen -r to minitor process output
     def monitor(self, pid):
         cmd = 'screen -r %d' % (pid)
+        self.procs[pid] = subprocess.Popen('screen -r %d' % (self.pid),
+                                            shell=True,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT)
 
     def main_loop(self):
 
