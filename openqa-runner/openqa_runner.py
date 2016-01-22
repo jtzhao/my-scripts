@@ -25,25 +25,39 @@ logging.Logger._log = _new_log
 
 def run_with_heartbeat(cmd, msg, begin_msg=None, succ_msg=None,
                         fail_msg=None, no_check=False, interval=60):
-    if begin_msg is not None:
-        logging.info(begin_msg)
-    logging.info("># %s" % (cmd))
+    def _parse_msg(s, data):
+        tmpl = Template(s)
+        return tmpl.safe_substitute(data)
+
+    interval /= 3
+    start_time = datetime.datetime.now()
     proc = PopenWithName('', cmd)
+    if begin_msg is not None:
+        parsed_msg = _parse_msg(begin_msg, {'pid': proc.pid})
+        logging.info(parsed_msg)
+    logging.info("># %s" % (cmd))
     count = 0
     while proc.poll() is None:
         count += 1
         if count >= interval:
-            logging.info(msg)
+            td = datetime.datetime.now() - start_time
+            parsed_msg = _parse_msg(msg, {  'pid'       : proc.pid, 
+                                            'seconds'   : td.seconds,
+                                            'minutes'   : td.seconds/60})
+            logging.info(parsed_msg)
             count = 0
-        time.sleep(1)
+        time.sleep(3)
     if no_check or proc.poll() == 0:
-        if succ_msg is not None:
-            logging.info(succ_msg)
+        end_msg = succ_msg
     else:
-        if fail_msg is not None:
-            tmpl = Template(fail_msg)
-            fail_msg = Template(fail_msg).safe_substitute(exitstatus=str(proc.poll()))
-            logging.info(fail_msg)
+        end_msg = fail_msg
+    if end_msg is not None:
+        td = datetime.datetime.now() - start_time
+        parsed_msg = _parse_msg(end_msg, { 'pid'       : proc.pid,
+                                        'exitstatus': proc.poll(),
+                                        'seconds'   : td.seconds,
+                                        'minutes'   : td.seconds/60})
+        logging.info(parsed_msg)
     return proc.poll(), proc.stdout.read()
 
 def zypper_list_repo():
@@ -91,17 +105,18 @@ def zypper_install(package):
 
 def create_qaset_config(testsuites):
     # Create dirs
-    os.makedirs('/root/qaset')
+    try:
+        os.makedirs('/root/qaset')
+    except OSError, e:
+        pass
     # Write to config file
-    s = Template("echo 'SQ_TEST_RUN_LIST=(\n$testsuites\n)")
-    s.substitute(testsuites=testsuites)
+    testsuites = '\n'.join(testsuites)
+    s = Template("SQ_TEST_RUN_LIST=(\n\t_reboot_off\n\t$testsuites\n)\n")
     with file('/root/qaset/config', 'w') as f:
-        f.write(s)
+        f.write(s.substitute({'testsuites': testsuites}))
 
 def init(args):
     random.seed()
-    assert args.test is not None, "No testsuites provided. Please use the -t option"
-    args.test = args.test.split(',')
     if args.package is None:
         args.package = ['qa_testset_automation',]
     # Remove existing repos
@@ -114,22 +129,20 @@ def init(args):
     # Install packages
     zypper_install(' '.join(args.package))
     # Create config file
-    create_qaset_config()
+    args.testsuite = args.testsuite.split(',')
+    create_qaset_config(args.testsuite)
 
 def upload_log(log_tarball, upload_url_prefix):
-    upload_url = "%s/uploadlog/%s"  % (log_tarball, upload_url_prefix,
+    upload_url = "%s/uploadlog/%s"  % (upload_url_prefix,
                                         os.path.basename(log_tarball))
     cmd = "curl --form upload='%s' '%s'" % (log_tarball, upload_url)
-    return run_with_heartbeat(cmd,
-                        'Uploading "%s"' % (log_tarball),
-                        succ_msg='Upload succeeded',
-                        fail_msg='Upload failed with exit code $exitstatus')
+    return run_with_heartbeat(cmd, 'Uploading "%s"' % (log_tarball),
+                            succ_msg='Upload succeeded',
+                            fail_msg='Upload failed with exit code $exitstatus')
 
 def upload_all_logs(log_dir, upload_url_prefix, pattern='*.tar.*'):
     for item in glob.glob(os.path.join(log_dir, pattern)):
         upload_log(item, upload_url_prefix)
-
-
 
 class PopenWithName(subprocess.Popen):
     def __init__(self, name, cmd):
@@ -224,29 +237,60 @@ class OpenqaRunner(object):
             return
         raise RuntimeError("No test process found")
 
+    def get_test_proc(self, lst=None):
+        def _filter_test_proc(item):
+            pid, name, status = item
+            if name.endswith("-%s" % (self.name)):
+                return False
+            return True
+        if lst is None:
+            lst = self.list_proc()
+        lst = filter(_filter_test_proc, lst)
+        assert len(lst) == 1, "Failed to find test proc: %s" % (lst)
+        return lst[0]
+
     def test_proc_finished(self):
         if self.proc.poll() is None:
             return False
         return True
 
+#    def main_loop(self, interval=3):
+#        lst = self.list_proc()
+#        while self.testrun_finished(lst) == False:
+#            if self.proc is not None:
+#                time.sleep(interval)
+#                td = datetime.datetime.now() - self.timestamp
+#                if self.test_proc_finished():
+#                    logging.info('"%s" finished in %.1fm' % (self.proc.name, td.seconds/60.0))
+#                    self.proc = None
+#                    self.timestamp = None
+#                else:
+#                    logging.info('"%s" running for %ds' % (self.proc.name, td.seconds))
+#            if self.proc is None:
+#                try:
+#                    self.start_test_monitor(lst)
+#                except RuntimeError, e:
+#                    logging.info('No test process found')
+#                    time.sleep(10)
+#            lst = self.list_proc()
+
     def main_loop(self, interval=3):
         lst = self.list_proc()
         while self.testrun_finished(lst) == False:
-            if self.proc is not None:
-                time.sleep(interval)
-                td = datetime.datetime.now() - self.timestamp
-                if self.test_proc_finished():
-                    logging.info('"%s" finished in %.1fm' % (self.proc.name, td.seconds/60.0))
-                    self.proc = None
-                    self.timestamp = None
-                else:
-                    logging.info('"%s" running for %ds' % (self.proc.name, td.seconds))
-            if self.proc is None:
-                try:
-                    self.start_test_monitor(lst)
-                except RuntimeError, e:
-                    logging.info('No test process found')
-                    time.sleep(10)
+            try:
+                pid, name, status = self.get_test_proc(lst)
+            except AssertionError, e:
+                logging.warning("No test process found")
+                time.sleep(3)
+                lst = self.list_proc()
+                continue
+            cmd = 'screen -r %d' % (pid)
+            run_with_heartbeat( cmd, '${pid}.%s running for ${seconds}s' % (name),
+                                begin_msg='Test process found: ${pid}.%s' % (name),
+                                succ_msg='${pid}.%s succeeded in ${minutes}m' % (name),
+                                fail_msg='${pid}.%s failed with code ${exitstatus} in ${minutes}m' % (name),
+                                interval=interval,
+                                no_check=False)
             lst = self.list_proc()
 
     def reset(self):
@@ -263,6 +307,7 @@ class OpenqaRunner(object):
         self.main_loop()
         self.stop_main_monitor()
 
+
 if __name__ == '__main__':
     # Parse args
     parser = argparse.ArgumentParser(description='OpenQA test runner')
@@ -270,7 +315,7 @@ if __name__ == '__main__':
                         help='Script to start testing')
     parser.add_argument('-u', '--upload-url-prefix', metavar='URL', dest='upload_url',
                         type=str, required=True, help='Upload url prefix')
-    parser.add_argument('-t', '--testsuite', metavar='TESTSUITE', dest='test',
+    parser.add_argument('-t', '--testsuite', metavar='TESTSUITE', dest='testsuite',
                         type=str, required=True, help='Testsuites to run. Example: lvm2,gzip,ltp')
     parser.add_argument('-l', '--log-dir', metavar='DIR', dest='log_dir',
                         type=str, required=True, default='/var/log/qaset/log',
@@ -289,15 +334,28 @@ if __name__ == '__main__':
                         help='QA repo url')
     parser.add_argument('-p', '--package', action='append', dest='package',
                         help='Packages to install with zypper')
+    parser.add_argument('--junit-type', metavar='TYPE', dest='junit_type',
+                        type=str, required=True,
+                        help='Junit type')
+    parser.add_argument('--junit-file', metavar='FILE', dest='junit_file',
+                        type=str, required=True,
+                        help='Junit type')
     args = parser.parse_args()
-    print args
     # Init
-    init(args)
     logging.basicConfig(format='\r<%(asctime)s> [%(levelname)s] %(message)s\r',
                         datefmt='%H:%M:%S',
                         level=logging.INFO)
+    init(args)
     # Running test
     runner = OpenqaRunner(args.script)
     runner.run()
     # Upload logs
     upload_all_logs(args.log_dir, args.upload_url)
+    # Generate junit report
+    cmd = "/usr/share/qa/qaset/bin/junit_xml_gen.py %s -s %s -o %s -n '%s'" % (args.log_dir,
+                                                                            args.submission_dir,
+                                                                            args.junit_file,
+                                                                            args.junit_type)
+    subprocess.check_call(cmd, shell=True, stdin=None,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT)
