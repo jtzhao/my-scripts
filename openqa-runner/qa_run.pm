@@ -9,49 +9,74 @@
 # without any warranty.
 
 package qa_run;
-use POSIX qw/strftime/;
+use strict;
+use warnings;
+use POSIX 'strftime';
+use POSIX ':sys_wait_h';
 use base "opensusebasetest";
 use testapi;
 
-# $1: Logger level
-# $2: Message to log
-sub _logging {
-    my $level       = shift;
-    my $msg         = shift;
-    my $timestamp   = strftime('%H:%M:%S', localtime);
+sub logging {
+    my $msg     = shift;
+    my $level   = shift;
+    unless ($level) { $level = 'INFO'; }
+    my $timestamp = strftime('%H:%M:%S', localtime);
     printf("\r<%s> %s: %s\r\n", $timestamp, $level, $msg);
 }
 
-sub log_warning {
-    _logging("WARNING", shift);
-}
-
-sub log_error {
-    _logging("ERROR", shift);
-}
-
-sub log_info {
-    _logging("INFO", shift);
-}
-
-sub run_cmd {
-    my $cmd = shift;
-    print ">$ $cmd\n";
+sub run_shell {
+    my $name    = shift;
+    my $cmd     = shift;
+    print "[$name] >\$ $cmd\n";
     return system($cmd);
 }
 
-# $1 - Child process name
-# $2 - Child process command
-# $3 - Heartbeat interval. Default: 60
-sub run_cmd_with_heartbeat {
-    my ($name, $cmd, $interval) = @_;
-    unless ($interval) { $interval = 60 };
+sub run_shell_with_hearbeat {
+    my $name        = shift;
+    my $cmd         = shift;
+    my $interval    = shift;
+    unless ($interval) { $interval = 60; }
+    print "[$name] >\$ $cmd\n";
+    # fork and exec cmd
+    my $start = time;
     my $pid = fork;
-    exec $cmd unless ($pid);
-    sleep(3);
-    while (waitpid($pid, WNOHANG) == 0) {
-        log_info("'$name' running for ");
+    unless ($pid) { exec($cmd); }
+    my $ret;
+    while (($ret = waitpid($pid, WNOHANG)) == 0) {
+        sleep($interval);
+        logging("'$pid.$name' running for " . (time - $start) . "s");
     }
+    if ($ret == -1) {
+        logging("Failed to exec: $cmd", 'ERROR');
+    } else {
+        my $exitstatus = $? >> 8;
+        logging("'$pid.$name' exited with $exitstatus in " . (time - $start) . "s");
+    }
+    return $ret;
+}
+
+sub zypper_install {
+    my $cmd = "zypper -n install -f " . join(' ', @_);
+    return run_shell($cmd);
+}
+
+sub zypper_list_repos {
+    my $output = `zypper repos -u`;
+    if ($? != 0) { die "Failed to list repos with zypper"; }
+    my @repos;
+    foreach my $line (split(/\n/, $output)) {
+        if ($line =~ /^\d+\s*\|/) {
+            @values = split(/\|/, $line);
+            map { $_ =~ s/^\s+|\s+$//g } @values;
+            @keys = ('id', 'alias', 'name', 'enabled', 'gpg', 'refresh', 'uri');
+            my %repo = ();
+            for (my $i=0; $i < scalar @values; $i++) {
+                $repo{$keys[$i]} = $values[$i];
+            }
+            push(@repos, $repo);
+        }
+    }
+    return @repos;
 }
 
 sub create_qaset_config() {
@@ -71,11 +96,6 @@ sub junit_type() {
 
 sub test_suite() {
     die "you need to overload test_suite in your class";
-}
-
-sub zypper_install {
-    my $cmd = "zypper -n install -f " . join(' ', @_);
-    return system($cmd);
 }
 
 # qa_testset_automation validation test
