@@ -35,7 +35,7 @@ ARCH="$5"
 # Check Leanos
 search_repo "$URL/$PRODUCT-Leanos-$VERSION" $ARCH $PACKAGE
 # Check Modules
-MODULES=$(curl -s "$URL" | grep -oP "$PRODUCT-Module-[\w\-]+-$VERSION" | sort -h | uniq)
+MODULES=$(curl -s "$URL/" | grep -oP "$PRODUCT-Module-[\w\-]+-$VERSION" | sort -h | uniq)
 for module in $MODULES; do
     search_repo "$URL/$module" $ARCH $PACKAGE
 done
